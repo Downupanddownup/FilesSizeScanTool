@@ -30,6 +30,7 @@ TOP_N = 20
 TOP_FILES = 30
 HTML_MIN_BYTES = 10 * MiB
 HTML_MIN_RATIO = 0.01
+ROOT_ROWS = 200                # 根层最多铺开的行数，超过才折叠
 
 # 分类规则跑在"正斜杠规范化"后的路径上，省掉反斜杠转义
 DEFAULT_RULES = [
@@ -199,10 +200,10 @@ class Node(object):
 
 
 class Scanner(object):
-    def __init__(self, rules, fast=False, skip_prefix=None, progress=None):
+    def __init__(self, rules, fast=False, skip_prefixes=None, progress=None):
         self.rules = rules
         self.fast = fast
-        self.skip_prefix = skip_prefix
+        self.skip_prefixes = [p for p in (skip_prefixes or []) if p]
         self.progress = progress
         self.ops = 0
         self.running = 0
@@ -219,9 +220,11 @@ class Scanner(object):
         self.scan_seconds = 0.0
 
     def walk(self, path, depth):
-        if self.skip_prefix and norm(path).lower().startswith(self.skip_prefix):
-            self.skipped_reports += 1
-            return Node(os.path.basename(path) or path, depth)
+        if self.skip_prefixes:
+            low = norm(path).lower()
+            if any(low.startswith(p) for p in self.skip_prefixes):
+                self.skipped_reports += 1
+                return Node(os.path.basename(path) or path, depth)
 
         self.dir_count += 1
         self.ops += 1
@@ -341,6 +344,42 @@ def iter_nodes(node, path):
                 stack.append((os.path.join(p, kid.name), kid))
 
 
+# 可重建产物：名字命中的目录整块计入，不再往下走，避免父子重复计数
+REBUILD_DIRS = {
+    "node_modules": "node_modules",
+    ".git": ".git 仓库",
+    "__pycache__": "__pycache__",
+    "build": "构建产物 build/dist/target/obj",
+    "dist": "构建产物 build/dist/target/obj",
+    "target": "构建产物 build/dist/target/obj",
+    "obj": "构建产物 build/dist/target/obj",
+    ".gradle": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    ".m2": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    ".nuget": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    ".pnpm-store": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    "pnpm-store": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    ".cargo": "包管理器缓存 .gradle/.m2/.nuget/.pnpm-store",
+    ".venv": "Python 虚拟环境 .venv/venv/env",
+    "venv": "Python 虚拟环境 .venv/venv/env",
+    "env": "Python 虚拟环境 .venv/venv/env",
+}
+
+
+def rebuildable_totals(root_node):
+    """统计那些"删了能重建"的目录。命中即整块计入，不再深入。"""
+    buckets = {}
+    stack = list(root_node.kids or [])
+    while stack:
+        node = stack.pop()
+        key = REBUILD_DIRS.get(node.name.lower())
+        if key:
+            buckets[key] = buckets.get(key, 0) + node.size
+            continue
+        if node.kids:
+            stack.extend(node.kids)
+    return buckets
+
+
 # ---------- 输出：CSV / JSON / summary ----------
 
 def write_csv(node, root_path, fp, max_depth):
@@ -354,11 +393,11 @@ def write_csv(node, root_path, fp, max_depth):
                         "%.1f" % cur.elapsed if cur.depth == 1 else ""])
 
 
-def write_json(node, root_path, fp):
+def write_json(node, root_path, fp, mode="fast"):
     nodes = {}
     for path, cur in iter_nodes(node, root_path):
         nodes[path] = [cur.size, cur.files, cur.cat]
-    json.dump({"root": root_path, "nodes": nodes}, fp, ensure_ascii=False)
+    json.dump({"root": root_path, "mode": mode, "nodes": nodes}, fp, ensure_ascii=False)
 
 
 def write_summary(node, root_path, path_out, scanner, timings, baseline_path=None):
@@ -410,6 +449,18 @@ def write_summary(node, root_path, path_out, scanner, timings, baseline_path=Non
         pct = (size * 100.0 / node.size) if node.size else 0.0
         add("  %10s %6.1f%%  %s" % (human(size), pct, name))
     add("")
+    rebuild = rebuildable_totals(node)
+    if rebuild:
+        add("可重建产物（删了要重装/重建，不是垃圾）")
+        rsum = 0
+        for name, size in sorted(rebuild.items(), key=lambda kv: -kv[1]):
+            pct = (size * 100.0 / node.size) if node.size else 0.0
+            add("  %10s %6.1f%%  %s" % (human(size), pct, name))
+            rsum += size
+        pct = (rsum * 100.0 / node.size) if node.size else 0.0
+        add("  " + "-" * 46)
+        add("  %10s %6.1f%%  合计" % (human(rsum), pct))
+        add("")
 
     tops = [k for k in (node.kids or []) if k.depth == 1]
     if tops:
@@ -547,8 +598,11 @@ def render_tree(node, path, colors, out, open_levels=1):
     if not kids:
         return
     kids = sorted(kids, key=lambda n: n.size, reverse=True)
-    limit = max(node.size * HTML_MIN_RATIO, HTML_MIN_BYTES)
-    shown = [k for k in kids if k.size >= limit] or kids[:5]
+    if node.depth == 0:
+        shown = kids[:ROOT_ROWS]          # 根层不设阈值，全部铺开（上限 200 行）
+    else:
+        limit = max(node.size * HTML_MIN_RATIO, HTML_MIN_BYTES)
+        shown = [k for k in kids if k.size >= limit] or kids[:5]
     shown_ids = set(id(k) for k in shown)
     for kid in shown:
         pct = (kid.size * 100.0 / node.size) if node.size else 0.0
@@ -633,6 +687,22 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
         w("<div class='cat'><b>%s</b>%s · %.1f%%</div>" % (human(size), esc(name), pct))
     w("</div>")
 
+    rebuild = rebuildable_totals(node)
+    if rebuild:
+        w("<h2>可重建产物</h2>")
+        w("<p class='note'>删了要重装 / 重建，不属于垃圾。</p>")
+        w("<div class='cats'>")
+        rsum = 0
+        for name, size in sorted(rebuild.items(), key=lambda kv: -kv[1]):
+            pct = (size * 100.0 / node.size) if node.size else 0.0
+            w("<div class='cat'><b>%s</b>%s · %.1f%%</div>"
+              % (human(size), esc(name), pct))
+            rsum += size
+        pct = (rsum * 100.0 / node.size) if node.size else 0.0
+        w("<div class='cat' style='border-color:#3a4553'><b>%s</b>合计 · %.1f%%</div>"
+          % (human(rsum), pct))
+        w("</div>")
+
     w("<h2>目录树</h2>")
     w("<p class='note'>每层只铺开 ≥ 父目录 1%% 或 ≥ 10 MB 的子项，其余折成一行；点击三角展开。</p>")
     w("<div class='tree'><details open><summary><span class='name'>%s</span>"
@@ -650,6 +720,86 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
 
 # ---------- 主流程 ----------
 
+def signed(n):
+    return ("+" if n > 0 else "-") + human(abs(n))
+
+
+def load_tree(path):
+    with io.open(path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def compare_main(path_a, path_b, out_path):
+    """直接比较两份已有的 tree.json，不重新扫描。"""
+    try:
+        a, b = load_tree(path_a), load_tree(path_b)
+    except Exception as exc:
+        sys.stderr.write("读取失败：%s\n" % exc)
+        return 2
+
+    na, nb = a.get("nodes", {}), b.get("nodes", {})
+    root = b.get("root") or a.get("root") or ""
+    ma, mb = a.get("mode"), b.get("mode")
+
+    lines = []
+    add = lines.append
+    add("A  %s   [%s]" % (path_a, ma or "旧版报告，未记录模式"))
+    add("B  %s   [%s]" % (path_b, mb or "旧版报告，未记录模式"))
+    if ma and mb and ma != mb:
+        add("")
+        add("⚠ 两份报告的口径不同（%s vs %s）：一边做了硬链接去重、一边没有。" % (ma, mb))
+        add("  差异主要来自这里，不代表磁盘真实增减。要比真实变化，请用同模式再扫一次。")
+    add("")
+
+    ta = na.get(root, [0, 0])[0]
+    tb = nb.get(root, [0, 0])[0]
+    fa = na.get(root, [0, 0])[1]
+    fb = nb.get(root, [0, 0])[1]
+    add("总量  %s -> %s   %s (%+.2f%%)"
+        % (human(ta), human(tb), signed(tb - ta), (tb - ta) * 100.0 / ta if ta else 0))
+    add("文件  %s -> %s   (%+d)" % (fmt_int(fa), fmt_int(fb), fb - fa))
+    add("")
+
+    deltas = []
+    for p in set(na) & set(nb):
+        if p == root:
+            continue
+        d = nb[p][0] - na[p][0]
+        if abs(d) >= MiB:
+            deltas.append((d, nb[p][0], p))
+    deltas.sort(reverse=True)
+
+    add("增长 Top %d（≥1 MB）" % TOP_N)
+    if deltas:
+        for d, s, p in deltas[:TOP_N]:
+            if d <= 0:
+                break
+            add("  %12s  现 %10s   %s" % (signed(d), human(s), p))
+    else:
+        add("  无（没有超过 1 MB 的增长）")
+    add("")
+
+    add("减少 Top %d（≥1 MB）" % TOP_N)
+    shrinks = [x for x in deltas if x[0] < 0]
+    if shrinks:
+        for d, s, p in sorted(shrinks)[:TOP_N]:
+            add("  %12s  现 %10s   %s" % (signed(d), human(s), p))
+    else:
+        add("  无（没有超过 1 MB 的减少）")
+
+    gone = [p for p in na if p not in nb]
+    if gone:
+        add("")
+        add("已消失 %d 项，合计 %s" % (len(gone), human(sum(na[p][0] for p in gone))))
+
+    text = "\n".join(lines) + "\n"
+    with io.open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    sys.stdout.write(text)
+    sys.stdout.write("对照结果已写入 %s\n" % out_path)
+    return 0
+
+
 def main(argv=None):
     global TOP_N
     parser = argparse.ArgumentParser(
@@ -660,6 +810,8 @@ def main(argv=None):
                         help="精确模式：逐文件取 inode 做硬链接去重（慢约 5 倍）")
     parser.add_argument("--depth", type=int, default=10 ** 6, help="CSV 里保留的最大层级")
     parser.add_argument("--baseline", default=None, help="上一次的 tree.json，用于对比")
+    parser.add_argument("--compare", nargs=2, metavar=("A_JSON", "B_JSON"),
+                        help="直接比较两份已有的 tree.json，不重新扫描")
     parser.add_argument("--top", type=int, default=TOP_N, help="Top 榜条数")
     args = parser.parse_args(argv)
     TOP_N = args.top
@@ -688,11 +840,18 @@ def main(argv=None):
     colors = {r[0]: r[1] for r in rules}
     base = os.path.abspath(args.out or os.path.join(script_dir, "reports"))
 
+    if args.compare:
+        os.makedirs(base, exist_ok=True)
+        out = os.path.join(base, "compare-%s.txt" % time.strftime("%Y%m%d-%H%M%S"))
+        return compare_main(args.compare[0], args.compare[1], out)
+
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.time()
     want_progress = sys.stderr.isatty() or os.environ.get("DISKMAP_FORCE_PROGRESS") == "1"
     progress = Progress(root, enabled=want_progress)
-    scanner = Scanner(rules, fast=not args.exact, skip_prefix=norm(base).lower(),
+    scanner = Scanner(rules, fast=not args.exact,
+                      skip_prefixes=[norm(os.path.join(script_dir, "reports")).lower(),
+                                     norm(base).lower()],
                       progress=progress)
     node = scanner.scan(root)
     progress.finish()
@@ -709,7 +868,7 @@ def main(argv=None):
                  encoding="utf-8-sig", newline="") as f:
         write_csv(node, root, f, args.depth)
     with io.open(os.path.join(report_dir, "tree.json"), "w", encoding="utf-8") as f:
-        write_json(node, root, f)
+        write_json(node, root, f, "fast" if scanner.fast else "exact")
     write_html(node, root, os.path.join(report_dir, "index.html"), scanner, timings, colors)
     timings["end"] = time.strftime("%Y-%m-%d %H:%M:%S")
     timings["total"] = time.time() - t0
