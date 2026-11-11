@@ -1,0 +1,7 @@
+[
+  {"name": "updater-cache", "color": "#c0392b", "pattern": "(^|/)[^/]*updater$"},
+  {"name": "pkg-cache",     "color": "#b9770e", "pattern": "(?i)(/\\.nuget$|/\\.m2$|/\\.gradle$|npm-cache$|/pnpm$|pnpm-cache$|node-gyp$|/pip$|/Dependencies$)"},
+  {"name": "temp",          "color": "#7d6608", "pattern": "(?i)(/Temp$|/Logs?$|/Cache$|Code Cache$|CrashDumps$)"},
+  {"name": "browser",       "color": "#6c3483", "pattern": "(?i)(User Data/[^/]+$|User Data/Default$)"},
+  {"name": "system",        "color": "#1f618d", "pattern": "(?i)(/Windows$|WinSxS|pagefile\\.sys|hiberfil\\.sys|swapfile\\.sys|DriverStore$|/Recovery$)"}
+]
