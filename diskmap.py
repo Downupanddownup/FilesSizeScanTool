@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -72,6 +73,89 @@ def stamp(ts):
     return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "-"
 
 
+def mmss(seconds):
+    """秒数换成 mm:ss（超过一小时再加小时）。"""
+    s = int(seconds)
+    if s >= 3600:
+        return "%d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+    return "%d:%02d" % (s // 60, s % 60)
+
+
+def shorten(text, limit):
+    """从左边截断，保留末尾——路径的前缀没有信息量。"""
+    if limit <= 1 or len(text) <= limit:
+        return text
+    return "…" + text[-(limit - 1):]
+
+
+def _enable_vt():
+    """开启 Windows 控制台的 VT 转义支持，失败返回 False（走降级路径）。"""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-12)          # STD_ERROR_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & 0x0004:                       # 已启用
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+class Progress(object):
+    """两行进度：第一行心跳，第二行当前位置。写 stderr，不碰 stdout。"""
+
+    def __init__(self, root, enabled):
+        self.root = root
+        self.enabled = bool(enabled)
+        self.vt = False
+        self.last = 0.0
+        self.started = time.time()
+        self.printed = False
+        self.width = 100
+        if self.enabled:
+            try:
+                self.width = max(60, shutil.get_terminal_size((100, 24)).columns - 2)
+            except Exception:
+                pass
+            self.vt = _enable_vt()
+            if not self.vt:
+                sys.stderr.write("（当前终端不支持原地刷新，进度改为逐行追加）\n")
+
+    def update(self, ops, size, path):
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self.last < 1.0:
+            return
+        self.last = now
+        line1 = "任务 %s  ·  已扫 %s 条目 · %s · %s" % (
+            self.root, fmt_int(ops), human(size), mmss(now - self.started))
+        line2 = "正在扫描 " + shorten(path, self.width - 12)
+        line1 = line1[:self.width].ljust(self.width)
+        line2 = line2[:self.width].ljust(self.width)
+        out = sys.stderr
+        if self.vt:
+            if self.printed:
+                out.write("\x1b[2A")               # 回到上两行
+            out.write("\x1b[2K" + line1 + "\n")
+            out.write("\x1b[2K" + line2 + "\n")
+            self.printed = True
+        else:
+            out.write(line1.rstrip() + "\n")
+        out.flush()
+
+    def finish(self):
+        if not self.enabled:
+            return
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
 def esc(s):
     return _html.escape(s, quote=False)
 
@@ -101,7 +185,7 @@ def load_rules(script_dir):
 # ---------- 扫描 ----------
 
 class Node(object):
-    __slots__ = ("name", "depth", "size", "files", "mtime", "kids", "cat")
+    __slots__ = ("name", "depth", "size", "files", "mtime", "kids", "cat", "elapsed")
 
     def __init__(self, name, depth):
         self.name = name
@@ -111,13 +195,17 @@ class Node(object):
         self.mtime = 0.0
         self.kids = None
         self.cat = "data"
+        self.elapsed = 0.0
 
 
 class Scanner(object):
-    def __init__(self, rules, fast=False, skip_prefix=None):
+    def __init__(self, rules, fast=False, skip_prefix=None, progress=None):
         self.rules = rules
         self.fast = fast
         self.skip_prefix = skip_prefix
+        self.progress = progress
+        self.ops = 0
+        self.running = 0
         self.seen = set()
         self.dir_count = 0
         self.file_count = 0
@@ -136,6 +224,9 @@ class Scanner(object):
             return Node(os.path.basename(path) or path, depth)
 
         self.dir_count += 1
+        self.ops += 1
+        if self.progress is not None:
+            self.progress.update(self.ops, self.running, path)
         node = Node(os.path.basename(path) or path, depth)
         try:
             it = os.scandir(path)
@@ -154,7 +245,10 @@ class Scanner(object):
                     self.links += 1
                     continue
                 if entry.is_dir(follow_symlinks=False):
+                    self.ops += 1
+                    child_start = time.time()
                     child = self.walk(entry.path, depth + 1)
+                    child.elapsed = time.time() - child_start
                     node.size += child.size
                     node.files += child.files
                     if child.mtime > node.mtime:
@@ -163,6 +257,8 @@ class Scanner(object):
                         node.kids = []
                     node.kids.append(child)
                 else:
+                    self.ops += 1
+                    self.running += st.st_size
                     self.logical += st.st_size
                     self.file_entries += 1
                     if depth == 0 and entry.name.lower() in SYSTEM_FILE_NAMES:
@@ -249,11 +345,13 @@ def iter_nodes(node, path):
 
 def write_csv(node, root_path, fp, max_depth):
     w = csv.writer(fp)
-    w.writerow(["path", "depth", "size_bytes", "size", "files", "last_write", "category"])
+    w.writerow(["path", "depth", "size_bytes", "size", "files", "last_write",
+                "category", "elapsed_s"])
     for path, cur in iter_nodes(node, root_path):
         if cur.depth <= max_depth:
             w.writerow([path, cur.depth, cur.size, human(cur.size), cur.files,
-                        stamp(cur.mtime), cur.cat])
+                        stamp(cur.mtime), cur.cat,
+                        "%.1f" % cur.elapsed if cur.depth == 1 else ""])
 
 
 def write_json(node, root_path, fp):
@@ -271,6 +369,9 @@ def write_summary(node, root_path, path_out, scanner, timings, baseline_path=Non
     add("结束      %s" % timings["end"])
     add("耗时      %.1f s（枚举 %.1f / 写出 %.1f）"
         % (timings["total"], scanner.scan_seconds, timings["write"]))
+    rate = (scanner.dir_count + scanner.file_entries) / scanner.scan_seconds \
+        if scanner.scan_seconds > 0 else 0
+    add("条目/秒   %s        冷启动一般 2,500–4,000，热缓存更高" % fmt_int(int(rate)))
     add("")
     add("目录数    %s" % fmt_int(scanner.dir_count))
     if scanner.fast:
@@ -283,15 +384,19 @@ def write_summary(node, root_path, path_out, scanner, timings, baseline_path=Non
     if scanner.skipped_reports:
         add("排除报告  %s 个目录  报告目录自身不计入" % fmt_int(scanner.skipped_reports))
     add("")
-    add("物理占用  %s" % human(node.size))
-    add("逻辑占用  %s       %s" % (human(scanner.logical),
-                                   "未去重，含硬链接重复" if scanner.fast else "硬链接已去重"))
+    if scanner.fast:
+        add("总占用    %s" % human(node.size))
+        add("          未去重，含硬链接重复（通常偏高 1–7%；要精确请加 --exact）")
+    else:
+        add("物理占用  %s" % human(node.size))
+        add("逻辑占用  %s       硬链接已去重" % human(scanner.logical))
     add("")
 
     add("按目录 Top %d" % TOP_N)
     for k in sorted(node.kids or [], key=lambda n: n.size, reverse=True)[:TOP_N]:
         pct = (k.size * 100.0 / node.size) if node.size else 0.0
-        add("  %10s %6.1f%%   %s" % (human(k.size), pct, os.path.join(root_path, k.name)))
+        add("  %10s %6.1f%%  %9s 文件   %s"
+            % (human(k.size), pct, fmt_int(k.files), os.path.join(root_path, k.name)))
     add("")
 
     add("按文件 Top %d" % TOP_FILES)
@@ -305,6 +410,16 @@ def write_summary(node, root_path, path_out, scanner, timings, baseline_path=Non
         pct = (size * 100.0 / node.size) if node.size else 0.0
         add("  %10s %6.1f%%  %s" % (human(size), pct, name))
     add("")
+
+    tops = [k for k in (node.kids or []) if k.depth == 1]
+    if tops:
+        add("顶层目录耗时 Top 10")
+        for k in sorted(tops, key=lambda n: -n.elapsed)[:10]:
+            add("  %8s   %10s 文件  %10s   %s"
+                % (mmss(k.elapsed), fmt_int(k.files), human(k.size),
+                   os.path.join(root_path, k.name)))
+        add("")
+
     add("注：denied 目录（%d 个）与跳过的链接未计入上述合计。" % len(scanner.denied))
 
     if baseline_path:
@@ -370,7 +485,9 @@ table.top tr:last-child td{border-bottom:none}
 .size{font-family:Consolas,monospace;font-feature-settings:"tnum";color:#9ecbff;
  white-space:nowrap;width:96px}
 .pct{color:var(--dim);font-family:Consolas,monospace;width:56px;text-align:right}
-.barcell{width:34%;padding-right:16px}
+.cnt{color:var(--muted);font-family:Consolas,monospace;font-feature-settings:"tnum";
+ white-space:nowrap;width:110px;text-align:right;padding-right:14px}
+.barcell{width:30%;padding-right:16px}
 .bar{height:5px;border-radius:3px;background:rgba(91,155,248,.18);position:relative;overflow:hidden}
 .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;
  background:linear-gradient(90deg,#4a86e8,#6fb0ff)}
@@ -471,6 +588,9 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
     w("<span class='chip'>文件<b>%s</b></span>" % fmt_int(scanner.file_count))
     w("<span class='chip'>跳过链接<b>%s</b></span>" % fmt_int(scanner.links))
     w("<span class='chip'>无权限<b>%s</b></span>" % fmt_int(len(scanner.denied)))
+    rate = (scanner.dir_count + scanner.file_entries) / scanner.scan_seconds \
+        if scanner.scan_seconds > 0 else 0
+    w("<span class='chip'>条目/秒<b>%s</b></span>" % fmt_int(int(rate)))
     w("</div></header>")
 
     top_dirs = sorted(node.kids or [], key=lambda n: n.size, reverse=True)[:TOP_N]
@@ -478,11 +598,25 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
     peak = top_dirs[0].size if top_dirs else 0
     for k in top_dirs:
         pct = (k.size * 100.0 / node.size) if node.size else 0.0
-        w("<tr><td class='size'>%s</td><td class='pct'>%.1f%%</td>%s"
-          "<td class='pathcell'>%s</td></tr>"
-          % (human(k.size), pct, bar_cell(k.size, peak),
+        w("<tr><td class='size'>%s</td><td class='pct'>%.1f%%</td>"
+          "<td class='cnt'>%s 文件</td>%s<td class='pathcell'>%s</td></tr>"
+          % (human(k.size), pct, fmt_int(k.files), bar_cell(k.size, peak),
              esc(os.path.join(root_path, k.name))))
     w("</table>")
+
+    tops = sorted([k for k in (node.kids or []) if k.depth == 1],
+                  key=lambda n: -n.elapsed)[:10]
+    if tops:
+        w("<h2>顶层目录耗时 Top %d</h2><table class='top'>" % len(tops))
+        peak_t = tops[0].elapsed or 1.0
+        for k in tops:
+            share = (k.elapsed * 100.0 / scanner.scan_seconds) \
+                if scanner.scan_seconds > 0 else 0.0
+            w("<tr><td class='size'>%s</td><td class='pct'>%.1f%%</td>%s"
+              "<td class='pathcell'>%s</td></tr>"
+              % (mmss(k.elapsed), share, bar_cell(k.elapsed, peak_t),
+                 esc(os.path.join(root_path, k.name))))
+        w("</table>")
 
     w("<h2>按文件 Top %d</h2><table class='top'>" % TOP_FILES)
     files = sorted(scanner.top_files, reverse=True)[:TOP_FILES]
@@ -522,7 +656,8 @@ def main(argv=None):
         description="扫描目录树，输出可折叠的 HTML 报告（只读，不删除任何文件）")
     parser.add_argument("root", nargs="?", default=".", help="扫描根目录，默认当前目录")
     parser.add_argument("--out", default=None, help="报告输出目录，默认 <脚本目录>/reports")
-    parser.add_argument("--fast", action="store_true", help="不取 inode，跳过硬链接去重")
+    parser.add_argument("--exact", action="store_true",
+                        help="精确模式：逐文件取 inode 做硬链接去重（慢约 5 倍）")
     parser.add_argument("--depth", type=int, default=10 ** 6, help="CSV 里保留的最大层级")
     parser.add_argument("--baseline", default=None, help="上一次的 tree.json，用于对比")
     parser.add_argument("--top", type=int, default=TOP_N, help="Top 榜条数")
@@ -555,8 +690,12 @@ def main(argv=None):
 
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     t0 = time.time()
-    scanner = Scanner(rules, fast=args.fast, skip_prefix=norm(base).lower())
+    want_progress = sys.stderr.isatty() or os.environ.get("DISKMAP_FORCE_PROGRESS") == "1"
+    progress = Progress(root, enabled=want_progress)
+    scanner = Scanner(rules, fast=not args.exact, skip_prefix=norm(base).lower(),
+                      progress=progress)
     node = scanner.scan(root)
+    progress.finish()
     scanner.categorize(node, root)
 
     name = root.rstrip("\\/") or "root"
@@ -584,7 +723,7 @@ def main(argv=None):
     sys.stdout.write("scan done\n")
     sys.stdout.write("  root    %s\n" % root)
     sys.stdout.write("  total   %s%s\n" % (human(node.size),
-                                           " (no dedupe)" if scanner.fast else " (physical)"))
+                                           " (exact)" if not scanner.fast else ""))
     sys.stdout.write("  dirs    %s\n" % fmt_int(scanner.dir_count))
     sys.stdout.write("  files   %s\n" % fmt_int(scanner.file_count))
     sys.stdout.write("  time    %.1f s\n" % timings["total"])
