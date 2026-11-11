@@ -161,6 +161,10 @@ def esc(s):
     return _html.escape(s, quote=False)
 
 
+def esc_attr(s):
+    return _html.escape(s, quote=True)
+
+
 def hex_rgba(value, alpha):
     """#rrggbb -> rgba(...)，给自定义分类的徽章上色用。"""
     try:
@@ -561,6 +565,13 @@ details[open]>summary>.name{color:#fff;font-weight:500}
  padding:3px 6px 3px 21px;white-space:nowrap;color:#d5dee8}
 .leaf:hover{background:rgba(91,155,248,.07);border-radius:5px}
 .more{margin:3px 0 3px 27px;color:#8b98a8;font-size:13px;font-style:italic}
+.copy{display:none;background:none;border:1px solid transparent;color:var(--dim);
+ cursor:pointer;font:inherit;font-size:13px;line-height:1;padding:1px 5px;
+ border-radius:4px;margin-left:8px;vertical-align:1px}
+body.js .copy{display:inline-block}
+summary:hover .copy,.leaf:hover .copy,.copy:focus{color:var(--accent);
+ border-color:var(--line);outline:none}
+.copy.ok{color:var(--green);border-color:rgba(76,195,138,.45)}
 .tag{font-size:10.5px;letter-spacing:.3px;border-radius:4px;padding:1px 6px;margin-left:8px;
  background:rgba(224,108,117,.14);color:var(--red);border:1px solid rgba(224,108,117,.25)}
 .tag.pkg-cache{background:rgba(224,164,88,.13);color:var(--amber);border-color:rgba(224,164,88,.25)}
@@ -577,6 +588,48 @@ footer{margin-top:40px;color:var(--dim);font-size:12px;
  border-top:1px solid var(--line);padding-top:14px}
 """
 
+# 仅用于"复制完整路径"。没有它，报告照常可读，只是没有复制按钮。
+JS = """
+<script>
+document.body.classList.add('js');
+(function () {
+  var btns = document.querySelectorAll('button.copy');
+  for (var i = 0; i < btns.length; i++) {
+    (function (b) {
+      b.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();          /* 别让点击冒泡到 summary 触发折叠 */
+        var p = b.getAttribute('data-p');
+        var ok = function () {
+          b.classList.add('ok');
+          b.textContent = '✓';
+          setTimeout(function () {
+            b.classList.remove('ok');
+            b.textContent = '⧉';
+          }, 1500);
+        };
+        var fallback = function () {
+          var t = document.createElement('textarea');
+          t.value = p;
+          t.style.position = 'fixed';
+          t.style.left = '-9999px';
+          document.body.appendChild(t);
+          t.select();
+          try { document.execCommand('copy'); ok(); } catch (err) {}
+          document.body.removeChild(t);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(p).then(ok, fallback);
+        } else {
+          fallback();
+        }
+      });
+    })(btns[i]);
+  }
+})();
+</script>
+"""
+
 
 def tag_html(name, colors):
     if name == "data":
@@ -586,6 +639,12 @@ def tag_html(name, colors):
     color = colors.get(name, "#888888")
     return ('<span class="tag" style="background:%s;border-color:%s;color:%s">%s</span>'
             % (hex_rgba(color, 0.14), hex_rgba(color, 0.28), color, esc(name)))
+
+
+def copy_btn(path):
+    """行尾的复制按钮——默认不显示，JS 跑起来才出现。"""
+    return ('<button class="copy" data-p="%s" title="复制完整路径" '
+            'aria-label="复制完整路径">&#10697;</button>' % esc_attr(path))
 
 
 def bar_cell(size, peak):
@@ -606,14 +665,15 @@ def render_tree(node, path, colors, out, open_levels=1):
     shown_ids = set(id(k) for k in shown)
     for kid in shown:
         pct = (kid.size * 100.0 / node.size) if node.size else 0.0
+        child_path = os.path.join(path, kid.name)
         badge = tag_html(kid.cat, colors) if kid.cat != node.cat else ""
-        tail = ('<span class="sz">%s</span><span class="pc">%.1f%%</span>%s'
-                % (human(kid.size), pct, badge))
+        tail = ('<span class="sz">%s</span><span class="pc">%.1f%%</span>%s%s'
+                % (human(kid.size), pct, badge, copy_btn(child_path)))
         if kid.kids:
             open_attr = " open" if kid.depth < open_levels else ""
             out.append('<details%s><summary><span class="name">%s</span>%s</summary>'
                        % (open_attr, esc(kid.name), tail))
-            render_tree(kid, os.path.join(path, kid.name), colors, out, open_levels)
+            render_tree(kid, child_path, colors, out, open_levels)
             out.append("</details>")
         else:
             out.append('<div class="leaf"><span class="name">%s</span>%s</div>'
@@ -705,6 +765,7 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
 
     w("<h2>目录树</h2>")
     w("<p class='note'>每层只铺开 ≥ 父目录 1%% 或 ≥ 10 MB 的子项，其余折成一行；点击三角展开。</p>")
+    w("<p class='note'>点每行右侧的 &#10697; 复制完整路径，Win+R 粘贴回车即可在资源管理器打开。</p>")
     w("<div class='tree'><details open><summary><span class='name'>%s</span>"
       "<span class='sz'>%s</span></summary>"
       % (esc(os.path.basename(root_path) or root_path), human(node.size)))
@@ -712,6 +773,7 @@ def write_html(node, root_path, path_out, scanner, timings, colors):
     w("</details></div>")
 
     w("<footer>diskmap · 只读扫描 · 数据为本次枚举结果</footer>")
+    w(JS)
     w("</div></body></html>")
 
     with io.open(path_out, "w", encoding="utf-8") as f:
